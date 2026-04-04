@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Smart Weather Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+  margin: 0;
+  font-family: 'Segoe UI', sans-serif;
+  background: linear-gradient(135deg, #0f172a, #1e293b);
+  color: white;
+  transition: 0.3s;
+}
+
+.light {
+  background: #f1f5f9;
+  color: #111;
+}
+
+.container {
+  max-width: 1000px;
+  margin: auto;
+  padding: 20px;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.search-box {
+  display: flex;
+  gap: 10px;
+  margin: 20px 0;
+}
+
+input {
+  flex: 1;
+  padding: 12px;
+  border-radius: 10px;
+  border: none;
+}
+
+button {
+  padding: 12px 20px;
+  border: none;
+  border-radius: 10px;
+  background: #3b82f6;
+  color: white;
+  cursor: pointer;
+}
+
+.toggle {
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.time {
+  text-align: center;
+  margin-bottom: 15px;
+  opacity: 0.8;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 15px;
+}
+
+.card {
+  backdrop-filter: blur(10px);
+  background: rgba(255,255,255,0.08);
+  padding: 20px;
+  border-radius: 15px;
+  text-align: center;
+}
+
+.light .card {
+  background: white;
+}
+
+.value {
+  font-size: 26px;
+  font-weight: bold;
+}
+
+.label {
+  opacity: 0.7;
+}
+
+.status {
+  text-align: center;
+  margin-top: 10px;
+  color: #22c55e;
+}
+
+canvas {
+  margin-top: 20px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+  <div class="header">
+    <h2>🌦️ Smart Weather</h2>
+    <div class="toggle" onclick="toggleTheme()">🌙 Toggle</div>
+  </div>
+
+  <div class="search-box">
+    <input type="text" id="city" placeholder="Search city...">
+    <button onclick="getWeather()">Search</button>
+    <button onclick="getLocation()">📍</button>
+  </div>
+
+  <div class="time" id="time"></div>
+
+  <div class="grid">
+    <div class="card"><div class="value" id="temp">--</div><div class="label">Temp °C</div></div>
+    <div class="card"><div class="value" id="humidity">--</div><div class="label">Humidity %</div></div>
+    <div class="card"><div class="value" id="pressure">--</div><div class="label">Pressure</div></div>
+    <div class="card"><div class="value" id="wind">--</div><div class="label">Wind m/s</div></div>
+    <div class="card"><div class="value" id="condition">--</div><div class="label">Condition</div></div>
+  </div>
+
+  <canvas id="chart"></canvas>
+
+  <div class="status" id="status">Live updating...</div>
+</div>
+
+<script>
+const API_KEY = "87aeb751e5404f6a03c6204dee2f33d9";
+let currentCity = "Mumbai";
+
+let chartData = [];
+let labels = [];
+
+const ctx = document.getElementById('chart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    labels: labels,
+    datasets: [{
+      label: 'Temperature',
+      data: chartData,
+      fill: false,
+      tension: 0.3
+    }]
+  }
+});
+
+function updateChart(temp) {
+  const time = new Date().toLocaleTimeString();
+
+  if (chartData.length > 10) {
+    chartData.shift();
+    labels.shift();
+  }
+
+  chartData.push(temp);
+  labels.push(time);
+  chart.update();
+}
+
+async function getWeather() {
+  const input = document.getElementById("city").value;
+  if (input) currentCity = input;
+
+  document.getElementById("status").innerText = "Fetching...";
+
+  const res = await fetch(
+    `https://api.openweathermap.org/data/2.5/weather?q=${currentCity}&appid=${API_KEY}&units=metric`
+  );
+
+  const data = await res.json();
+
+  if (data.cod !== 200) {
+    document.getElementById("status").innerText = "City not found";
+    return;
+  }
+
+  document.getElementById("temp").innerText = data.main.temp;
+  document.getElementById("humidity").innerText = data.main.humidity;
+  document.getElementById("pressure").innerText = data.main.pressure;
+  document.getElementById("wind").innerText = data.wind.speed;
+  document.getElementById("condition").innerText = data.weather[0].main;
+
+  const localTime = new Date(Date.now() + data.timezone * 1000);
+  document.getElementById("time").innerText =
+    localTime.toUTCString();
+
+  updateChart(data.main.temp);
+
+  document.getElementById("status").innerText = "Live ✅";
+}
+
+function getLocation() {
+  navigator.geolocation.getCurrentPosition(async (pos) => {
+    const { latitude, longitude } = pos.coords;
+
+    const res = await fetch(
+      `https://api.openweathermap.org/data/2.5/weather?lat=${latitude}&lon=${longitude}&appid=${}&units=metric`
+    );
+
+    const data = await res.json();
+
+    currentCity = data.name;
+    getWeather();
+  });
+}
+
+function toggleTheme() {
+  document.body.classList.toggle("light");
+}
+
+// auto refresh
+setInterval(getWeather, 15000);
+
+// initial load
+getWeather();
+</script>
+
+</body>
+</html>
