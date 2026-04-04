@@ -1,224 +1,229 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
-const API_GEO = "https://geocoding-api.open-meteo.com/v1/search";
-const API_WX  = "https://api.open-meteo.com/v1/forecast";
+const GEO_URL = "https://geocoding-api.open-meteo.com/v1/search";
+const WX_URL  = "https://api.open-meteo.com/v1/forecast";
 
-const AQI_API = "https://air-quality-api.open-meteo.com/v1/air-quality";
+async function geocodeSearch(query) {
+  const res = await fetch(`${GEO_URL}?name=${encodeURIComponent(query)}&count=6&language=en&format=json`);
+  const d = await res.json();
+  return d.results || [];
+}
 
-function useNow() {
-  const [now, setNow] = useState(new Date());
-  useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(id);
-  }, []);
-  return now;
+async function fetchAtmo(lat, lon) {
+  const hourly = [
+    "temperature_2m","relative_humidity_2m","surface_pressure",
+    "windspeed_10m","wind_direction_10m","uv_index",
+    "precipitation","visibility","dewpoint_2m","apparent_temperature",
+    "cloudcover"
+  ].join(",");
+  const url = `${WX_URL}?latitude=${lat}&longitude=${lon}&hourly=${hourly}&current_weather=true&timezone=auto&forecast_days=1`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("API error");
+  const d = await res.json();
+  const h = d.hourly;
+  const cw = d.current_weather;
+  // Find the index closest to now in the hourly array
+  const now = new Date();
+  const hours = h.time.map(t => new Date(t));
+  let idx = 0;
+  let minDiff = Infinity;
+  hours.forEach((t, i) => { const diff = Math.abs(t - now); if (diff < minDiff) { minDiff = diff; idx = i; } });
+  return {
+    temperature:   cw?.temperature   ?? h.temperature_2m?.[idx],
+    windspeed:     cw?.windspeed      ?? h.windspeed_10m?.[idx],
+    wind_dir:      cw?.winddirection  ?? h.wind_direction_10m?.[idx],
+    humidity:      h.relative_humidity_2m?.[idx],
+    pressure:      h.surface_pressure?.[idx],
+    uv_index:      h.uv_index?.[idx],
+    precipitation: h.precipitation?.[idx],
+    visibility:    h.visibility?.[idx],
+    dewpoint:      h.dewpoint_2m?.[idx],
+    apparent:      h.apparent_temperature?.[idx],
+    cloudcover:    h.cloudcover?.[idx],
+    weathercode:   cw?.weathercode,
+  };
 }
 
 function pad(n) { return String(n).padStart(2, "0"); }
-
-function fmtTime(d) {
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+function fmt_time(d) { return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+function fmt_date(d) {
+  return d.toLocaleDateString("en-IN", { weekday:"long", day:"numeric", month:"long", year:"numeric" });
+}
+function windLabel(deg) {
+  if (deg == null) return "—";
+  const dirs = ["N","NE","E","SE","S","SW","W","NW"];
+  return dirs[Math.round(deg / 45) % 8];
+}
+function wxLabel(code) {
+  if (code == null) return "—";
+  if (code === 0) return "Clear Sky";
+  if (code <= 3)  return "Partly Cloudy";
+  if (code <= 9)  return "Foggy";
+  if (code <= 29) return "Drizzle / Rain";
+  if (code <= 39) return "Snow";
+  if (code <= 59) return "Thunderstorm";
+  if (code <= 79) return "Heavy Snow";
+  return "Storm";
+}
+function uvLabel(uv) {
+  if (uv == null) return { text:"—", color:"#94a3b8" };
+  if (uv < 3)  return { text:"Low",       color:"#22c55e" };
+  if (uv < 6)  return { text:"Moderate",  color:"#eab308" };
+  if (uv < 8)  return { text:"High",      color:"#f97316" };
+  if (uv < 11) return { text:"Very High", color:"#ef4444" };
+  return           { text:"Extreme",   color:"#a855f7" };
+}
+function fmt_vis(m) {
+  if (m == null) return "—";
+  return m >= 1000 ? `${(m/1000).toFixed(1)} km` : `${m} m`;
 }
 
-function fmtDate(d) {
-  return d.toLocaleDateString("en-IN", { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+function useClock() {
+  const [t, setT] = useState(new Date());
+  useEffect(() => { const id = setInterval(() => setT(new Date()), 1000); return () => clearInterval(id); }, []);
+  return t;
 }
 
-const PARAM_META = {
-  temperature:     { label: "Temperature",     unit: "°C",   icon: "🌡", range: [-40, 60],  color: "#ff6b35" },
-  humidity:        { label: "Humidity",         unit: "%",    icon: "💧", range: [0, 100],   color: "#38bdf8" },
-  windspeed:       { label: "Wind Speed",       unit: "km/h", icon: "💨", range: [0, 150],   color: "#a3e635" },
-  pressure:        { label: "Pressure",         unit: "hPa",  icon: "⏱", range: [960, 1040], color: "#c084fc" },
-  uv_index:        { label: "UV Index",         unit: "",     icon: "☀", range: [0, 11],    color: "#fbbf24" },
-  precipitation:   { label: "Precipitation",   unit: "mm",   icon: "🌧", range: [0, 50],    color: "#60a5fa" },
-};
-
-const DISPLAY_PARAMS = ["temperature", "humidity", "windspeed", "pressure"];
-
-function ArcGauge({ value, min, max, color, size = 120 }) {
-  const pct = Math.max(0, Math.min(1, (value - min) / (max - min)));
-  const r = 44, cx = 60, cy = 60;
-  const startAngle = -210, sweep = 240;
-  const toRad = deg => (deg * Math.PI) / 180;
-  const arc = (angle) => ({
-    x: cx + r * Math.cos(toRad(angle)),
-    y: cy + r * Math.sin(toRad(angle)),
-  });
-  const s = arc(startAngle);
-  const e = arc(startAngle + sweep * pct);
-  const large = sweep * pct > 180 ? 1 : 0;
-  const track = arc(startAngle + sweep);
-
+function Ring({ pct, color, size = 52, stroke = 4 }) {
+  const r = (size - stroke) / 2;
+  const circ = 2 * Math.PI * r;
+  const offset = circ * (1 - Math.max(0, Math.min(1, pct)));
   return (
-    <svg width={size} height={size} viewBox="0 0 120 120">
-      <defs>
-        <filter id={`glow-${color.replace("#","")}`}>
-          <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
-          <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
-        </filter>
-      </defs>
-      {/* track */}
-      <path
-        d={`M ${s.x} ${s.y} A ${r} ${r} 0 1 1 ${track.x} ${track.y}`}
-        fill="none" stroke="rgba(255,255,255,0.07)" strokeWidth="8" strokeLinecap="round"
+    <svg width={size} height={size} style={{ transform:"rotate(-90deg)", flexShrink:0 }}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#f1f5f9" strokeWidth={stroke} />
+      <circle
+        cx={size/2} cy={size/2} r={r} fill="none"
+        stroke={color} strokeWidth={stroke} strokeLinecap="round"
+        strokeDasharray={circ} strokeDashoffset={offset}
+        style={{ transition:"stroke-dashoffset 1.4s cubic-bezier(.4,0,.2,1)" }}
       />
-      {/* fill */}
-      {pct > 0.01 && (
-        <path
-          d={`M ${s.x} ${s.y} A ${r} ${r} 0 ${large} 1 ${e.x} ${e.y}`}
-          fill="none" stroke={color} strokeWidth="8" strokeLinecap="round"
-          filter={`url(#glow-${color.replace("#","")})`}
-          style={{ transition: "all 1s cubic-bezier(.4,0,.2,1)" }}
-        />
-      )}
     </svg>
   );
 }
 
-function ParamCard({ paramKey, value, loading }) {
-  const m = PARAM_META[paramKey];
-  const display = value !== null && value !== undefined ? Number(value).toFixed(paramKey === "pressure" ? 0 : 1) : "--";
-
+function StatCard({ label, value, unit, sub, pct, color, icon, delay = 0 }) {
+  const [vis, setVis] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setVis(true), delay); return () => clearTimeout(t); }, [delay]);
   return (
     <div style={{
-      background: "rgba(255,255,255,0.03)",
-      border: "1px solid rgba(255,255,255,0.08)",
-      borderRadius: 20,
-      padding: "24px 20px",
-      display: "flex",
-      flexDirection: "column",
-      alignItems: "center",
-      gap: 8,
-      position: "relative",
-      overflow: "hidden",
-      backdropFilter: "blur(12px)",
-      transition: "transform 0.2s, box-shadow 0.2s",
-      cursor: "default",
-    }}
-    onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-4px)"; e.currentTarget.style.boxShadow = `0 16px 40px ${m.color}22`; }}
-    onMouseLeave={e => { e.currentTarget.style.transform = "translateY(0)"; e.currentTarget.style.boxShadow = "none"; }}
-    >
-      {/* accent line top */}
-      <div style={{ position: "absolute", top: 0, left: "20%", right: "20%", height: 2, background: m.color, borderRadius: 2, opacity: 0.7 }} />
-
-      <div style={{ position: "relative" }}>
-        <ArcGauge value={value ?? m.range[0]} min={m.range[0]} max={m.range[1]} color={m.color} size={110} />
-        <div style={{
-          position: "absolute", inset: 0, display: "flex", flexDirection: "column",
-          alignItems: "center", justifyContent: "center", gap: 0,
-        }}>
-          <span style={{ fontSize: 22 }}>{m.icon}</span>
-          {loading ? (
-            <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 12 }}>…</span>
-          ) : (
-            <span style={{ color: "#fff", fontFamily: "'Space Mono', monospace", fontSize: 15, fontWeight: 700, lineHeight: 1 }}>
-              {display}
-              <span style={{ fontSize: 10, color: m.color, marginLeft: 2 }}>{m.unit}</span>
+      background:"#fff", borderRadius:20, padding:"22px 24px",
+      display:"flex", flexDirection:"column", gap:14,
+      boxShadow:"0 1px 2px rgba(0,0,0,0.04), 0 4px 16px rgba(0,0,0,0.04)",
+      opacity: vis ? 1 : 0,
+      transform: vis ? "translateY(0)" : "translateY(14px)",
+      transition:"opacity 0.5s ease, transform 0.5s ease",
+      border:"1px solid #f1f5f9",
+      position:"relative", overflow:"hidden",
+    }}>
+      <div style={{ position:"absolute", top:0, left:0, right:0, height:3, background:color, opacity:0.8, borderRadius:"20px 20px 0 0" }} />
+      <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:8 }}>
+        <div style={{ flex:1, minWidth:0 }}>
+          <div style={{ fontSize:10, fontWeight:500, letterSpacing:2.5, textTransform:"uppercase", color:"#94a3b8" }}>
+            {label}
+          </div>
+          <div style={{ marginTop:10, display:"flex", alignItems:"baseline", gap:5, flexWrap:"wrap" }}>
+            <span style={{ fontSize:38, fontWeight:800, letterSpacing:-2, color:"#0f172a", fontFamily:"'Fraunces', serif", lineHeight:1 }}>
+              {value ?? "—"}
             </span>
-          )}
+            {unit && <span style={{ fontSize:15, color:"#64748b", fontWeight:600, letterSpacing:-0.3 }}>{unit}</span>}
+          </div>
+          {sub && <div style={{ marginTop:5, fontSize:11, color:"#94a3b8", letterSpacing:0.3 }}>{sub}</div>}
         </div>
-      </div>
-
-      <div style={{ textAlign: "center" }}>
-        <div style={{ color: m.color, fontFamily: "'Syne', sans-serif", fontSize: 11, letterSpacing: 2, textTransform: "uppercase", fontWeight: 700 }}>
-          {m.label}
-        </div>
-        <div style={{ color: "rgba(255,255,255,0.25)", fontSize: 10, marginTop: 2 }}>
-          {m.range[0]} — {m.range[1]} {m.unit}
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6, paddingTop:2 }}>
+          <Ring pct={pct ?? 0} color={color} />
+          <span style={{ fontSize:20 }}>{icon}</span>
         </div>
       </div>
     </div>
   );
 }
 
-function PulseDot({ color }) {
+function RowStat({ label, value, accent }) {
   return (
-    <span style={{ position: "relative", display: "inline-block", width: 10, height: 10 }}>
-      <span style={{
-        position: "absolute", inset: 0, borderRadius: "50%", background: color,
-        animation: "pulse 2s infinite",
-      }} />
-      <span style={{ position: "absolute", inset: 2, borderRadius: "50%", background: color }} />
-    </span>
+    <div style={{
+      display:"flex", justifyContent:"space-between", alignItems:"center",
+      padding:"10px 0", borderBottom:"1px solid #f8fafc",
+    }}>
+      <span style={{ fontSize:11, color:"#94a3b8", letterSpacing:1.5, textTransform:"uppercase" }}>{label}</span>
+      <span style={{ fontSize:13, fontWeight:700, color: accent || "#0f172a", fontFamily:"'Fraunces', serif" }}>{value ?? "—"}</span>
+    </div>
   );
 }
 
-function SearchBar({ onSearch, searching }) {
+function Search({ onSelect, loading }) {
   const [q, setQ] = useState("");
-  const [suggestions, setSuggestions] = useState([]);
+  const [results, setResults] = useState([]);
   const [open, setOpen] = useState(false);
   const timer = useRef(null);
+  const wrapRef = useRef(null);
 
-  const fetchSuggestions = useCallback(async (val) => {
-    if (val.length < 2) { setSuggestions([]); setOpen(false); return; }
-    try {
-      const r = await fetch(`${API_GEO}?name=${encodeURIComponent(val)}&count=6&language=en&format=json`);
-      const d = await r.json();
-      if (d.results) { setSuggestions(d.results); setOpen(true); }
-      else { setSuggestions([]); setOpen(false); }
-    } catch { setSuggestions([]); }
+  useEffect(() => {
+    clearTimeout(timer.current);
+    if (q.length < 2) { setResults([]); setOpen(false); return; }
+    timer.current = setTimeout(async () => {
+      try {
+        const r = await geocodeSearch(q);
+        setResults(r); setOpen(r.length > 0);
+      } catch { setResults([]); }
+    }, 380);
+  }, [q]);
+
+  useEffect(() => {
+    const fn = (e) => { if (!wrapRef.current?.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", fn);
+    return () => document.removeEventListener("mousedown", fn);
   }, []);
 
-  const handleChange = (v) => {
-    setQ(v);
-    clearTimeout(timer.current);
-    timer.current = setTimeout(() => fetchSuggestions(v), 350);
-  };
-
   const pick = (item) => {
-    setQ(item.name + (item.country ? `, ${item.country}` : ""));
-    setOpen(false);
-    onSearch({ name: item.name, country: item.country, admin1: item.admin1, lat: item.latitude, lon: item.longitude });
+    setQ(`${item.name}${item.country ? ", " + item.country : ""}`);
+    setOpen(false); setResults([]);
+    onSelect({ name:item.name, country:item.country||"", admin1:item.admin1||"", lat:item.latitude, lon:item.longitude });
   };
 
   return (
-    <div style={{ position: "relative", width: "100%", maxWidth: 480 }}>
+    <div ref={wrapRef} style={{ position:"relative", width:"100%", maxWidth:420 }}>
       <div style={{
-        display: "flex", alignItems: "center", gap: 10,
-        background: "rgba(255,255,255,0.05)",
-        border: "1px solid rgba(255,255,255,0.12)",
-        borderRadius: 14, padding: "10px 16px",
-        backdropFilter: "blur(12px)",
+        display:"flex", alignItems:"center", gap:10,
+        background:"#fff", border:"1.5px solid #e2e8f0",
+        borderRadius:14, padding:"11px 16px",
+        boxShadow:"0 2px 8px rgba(0,0,0,0.05)",
       }}>
-        <span style={{ fontSize: 16, opacity: 0.5 }}>🔍</span>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2.5" strokeLinecap="round">
+          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+        </svg>
         <input
           value={q}
-          onChange={e => handleChange(e.target.value)}
-          placeholder="Search any city, place…"
+          onChange={e => setQ(e.target.value)}
+          placeholder="Search any city…"
           style={{
-            flex: 1, background: "none", border: "none", outline: "none",
-            color: "#fff", fontFamily: "'Syne', sans-serif", fontSize: 14,
-            letterSpacing: 0.5,
+            flex:1, border:"none", outline:"none", background:"none",
+            fontSize:13, color:"#0f172a", letterSpacing:0.3,
           }}
         />
-        {searching && <span style={{ color: "#a3e635", fontSize: 12, fontFamily: "monospace" }}>LOADING…</span>}
+        {loading && <div style={{ width:13, height:13, border:"2px solid #e2e8f0", borderTop:"2px solid #3b82f6", borderRadius:"50%", animation:"spin 0.8s linear infinite" }} />}
       </div>
-      {open && suggestions.length > 0 && (
+      {open && (
         <div style={{
-          position: "absolute", top: "calc(100% + 8px)", left: 0, right: 0,
-          background: "#0d1117", border: "1px solid rgba(255,255,255,0.1)",
-          borderRadius: 14, overflow: "hidden", zIndex: 100,
-          boxShadow: "0 20px 60px rgba(0,0,0,0.6)",
+          position:"absolute", top:"calc(100% + 6px)", left:0, right:0,
+          background:"#fff", borderRadius:14, overflow:"hidden",
+          border:"1px solid #e2e8f0", boxShadow:"0 16px 40px rgba(0,0,0,0.1)", zIndex:999,
         }}>
-          {suggestions.map((s, i) => (
-            <div key={i}
-              onClick={() => pick(s)}
+          {results.map((r, i) => (
+            <div key={i} onClick={() => pick(r)}
               style={{
-                padding: "12px 16px", cursor: "pointer", display: "flex", alignItems: "center", gap: 10,
-                borderBottom: i < suggestions.length - 1 ? "1px solid rgba(255,255,255,0.05)" : "none",
-                transition: "background 0.15s",
+                display:"flex", alignItems:"center", gap:12, padding:"11px 16px",
+                cursor:"pointer", borderBottom: i < results.length-1 ? "1px solid #f8fafc" : "none",
+                transition:"background 0.1s",
               }}
-              onMouseEnter={e => e.currentTarget.style.background = "rgba(163,230,53,0.08)"}
-              onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+              onMouseEnter={e => e.currentTarget.style.background="#f8fafc"}
+              onMouseLeave={e => e.currentTarget.style.background="#fff"}
             >
-              <span style={{ fontSize: 14 }}>📍</span>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2.5">
+                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>
+              </svg>
               <div>
-                <div style={{ color: "#fff", fontFamily: "'Syne', sans-serif", fontSize: 13, fontWeight: 600 }}>
-                  {s.name}
-                </div>
-                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 11 }}>
-                  {[s.admin1, s.country].filter(Boolean).join(", ")}
-                </div>
+                <div style={{ fontSize:13, fontWeight:700, color:"#0f172a", fontFamily:"'Fraunces', serif" }}>{r.name}</div>
+                <div style={{ fontSize:11, color:"#94a3b8" }}>{[r.admin1, r.country].filter(Boolean).join(", ")}</div>
               </div>
             </div>
           ))}
@@ -228,423 +233,264 @@ function SearchBar({ onSearch, searching }) {
   );
 }
 
-function StatRow({ label, value, unit, color }) {
+const DEFAULT_LOC = { name:"Mumbai", country:"IN", admin1:"Maharashtra", lat:19.076, lon:72.877 };
+
+export default function App() {
+  const now = useClock();
+  const [loc, setLoc] = useState(DEFAULT_LOC);
+  const [wx, setWx] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const timerRef = useRef(null);
+
+  const load = useCallback(async (l) => {
+    setLoading(true); setError(null);
+    try {
+      const data = await fetchAtmo(l.lat, l.lon);
+      setWx(data); setLastUpdated(new Date());
+    } catch { setError("Could not load atmospheric data. Check connection."); }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(DEFAULT_LOC); }, [load]);
+
+  useEffect(() => {
+    clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => load(loc), 5 * 60 * 1000);
+    return () => clearInterval(timerRef.current);
+  }, [loc, load]);
+
+  const handleSelect = useCallback((l) => { setLoc(l); load(l); }, [load]);
+  const uv = uvLabel(wx?.uv_index);
+
+  const cards = [
+    {
+      label:"Temperature", icon:"🌡",
+      value: wx?.temperature != null ? wx.temperature.toFixed(1) : null, unit:"°C",
+      sub: wx?.apparent != null ? `Feels like ${wx.apparent.toFixed(1)}°C` : null,
+      pct: wx?.temperature != null ? (wx.temperature + 10) / 60 : 0, color:"#f97316",
+    },
+    {
+      label:"Humidity", icon:"💧",
+      value: wx?.humidity != null ? Math.round(wx.humidity) : null, unit:"%",
+      sub: wx?.dewpoint != null ? `Dew point ${wx.dewpoint.toFixed(1)}°C` : null,
+      pct: wx?.humidity != null ? wx.humidity / 100 : 0, color:"#3b82f6",
+    },
+    {
+      label:"Wind Speed", icon:"💨",
+      value: wx?.windspeed != null ? wx.windspeed.toFixed(1) : null, unit:"km/h",
+      sub: wx?.wind_dir != null ? `${windLabel(wx.wind_dir)} · ${Math.round(wx.wind_dir)}°` : null,
+      pct: wx?.windspeed != null ? wx.windspeed / 100 : 0, color:"#10b981",
+    },
+    {
+      label:"Pressure", icon:"⏱",
+      value: wx?.pressure != null ? Math.round(wx.pressure) : null, unit:"hPa",
+      sub: wx?.pressure != null ? (wx.pressure > 1013 ? "High pressure" : "Low pressure") : null,
+      pct: wx?.pressure != null ? (wx.pressure - 950) / 100 : 0, color:"#8b5cf6",
+    },
+  ];
+
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
-      <span style={{ color: "rgba(255,255,255,0.45)", fontFamily: "'Syne', sans-serif", fontSize: 11, letterSpacing: 1.5, textTransform: "uppercase" }}>{label}</span>
-      <span style={{ color: color || "#fff", fontFamily: "'Space Mono', monospace", fontSize: 13, fontWeight: 700 }}>
-        {value !== null && value !== undefined ? `${value}${unit ? " " + unit : ""}` : "—"}
-      </span>
+    <div style={{ minHeight:"100vh", background:"#f8fafc" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,700;0,9..144,800;1,9..144,400&family=DM+Mono:wght@400;500&display=swap');
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+        body{-webkit-font-smoothing:antialiased}
+        input::placeholder{color:#cbd5e1}
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:0.35}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+      `}</style>
+
+      {/* Nav */}
+      <nav style={{
+        background:"#fff", borderBottom:"1px solid #f1f5f9",
+        padding:"0 clamp(16px,4vw,40px)",
+        position:"sticky", top:0, zIndex:50,
+        boxShadow:"0 1px 0 #f1f5f9",
+      }}>
+        <div style={{ maxWidth:1060, margin:"0 auto", display:"flex", alignItems:"center", justifyContent:"space-between", height:60 }}>
+          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+            <div style={{
+              width:34, height:34, borderRadius:10,
+              background:"linear-gradient(135deg,#3b82f6 0%,#6366f1 100%)",
+              display:"flex", alignItems:"center", justifyContent:"center", fontSize:17,
+            }}>🌍</div>
+            <span style={{ fontFamily:"'Fraunces', serif", fontWeight:800, fontSize:20, color:"#0f172a", letterSpacing:-0.5 }}>
+              Atmo<span style={{ color:"#3b82f6" }}>Watch</span>
+            </span>
+          </div>
+
+          <div style={{ display:"flex", alignItems:"center", gap:18 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+              <div style={{
+                width:7, height:7, borderRadius:"50%", background:"#22c55e",
+                boxShadow:"0 0 0 3px rgba(34,197,94,0.18)",
+                animation:"blink 2.5s ease infinite",
+              }} />
+              <span style={{ fontSize:11, color:"#64748b", letterSpacing:1.5, fontWeight:500 }}>LIVE</span>
+            </div>
+            <div style={{ width:1, height:18, background:"#e2e8f0" }} />
+            <div style={{ textAlign:"right" }}>
+              <div style={{ fontFamily:"'Fraunces', serif", fontSize:17, fontWeight:700, color:"#0f172a", letterSpacing:-0.5, lineHeight:1.1 }}>
+                {fmt_time(now)}
+              </div>
+              <div style={{ fontSize:10, color:"#94a3b8", marginTop:1 }}>
+                {now.toLocaleDateString("en-IN",{weekday:"short"})}
+              </div>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      <main style={{ maxWidth:1060, margin:"0 auto", padding:"30px clamp(16px,4vw,40px) 60px" }}>
+
+        {/* Header row */}
+        <div style={{ display:"flex", flexWrap:"wrap", alignItems:"flex-end", justifyContent:"space-between", gap:20, marginBottom:28, animation:"fadeUp 0.4s ease" }}>
+          <div>
+            <div style={{ fontSize:10, color:"#94a3b8", letterSpacing:2.5, textTransform:"uppercase", marginBottom:8, display:"flex", alignItems:"center", gap:6 }}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="2.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+              Monitoring Location
+            </div>
+            <div style={{ display:"flex", alignItems:"baseline", gap:10, flexWrap:"wrap" }}>
+              <h1 style={{ fontFamily:"'Fraunces', serif", fontSize:clamp(28,5,40), fontWeight:800, color:"#0f172a", letterSpacing:-1.5, lineHeight:1 }}>
+                {loc.name}
+              </h1>
+              <span style={{ fontFamily:"'Fraunces', serif", fontSize:18, color:"#94a3b8", fontWeight:300, fontStyle:"italic" }}>
+                {[loc.admin1, loc.country].filter(Boolean).join(", ")}
+              </span>
+            </div>
+            <div style={{ marginTop:6, fontSize:11, color:"#cbd5e1", letterSpacing:0.5 }}>
+              {loc.lat?.toFixed(4)}°N · {loc.lon?.toFixed(4)}°E · {fmt_date(now)}
+            </div>
+          </div>
+          <Search onSelect={handleSelect} loading={loading} />
+        </div>
+
+        {error && (
+          <div style={{ background:"#fef2f2", border:"1px solid #fecaca", borderRadius:12, padding:"12px 18px", marginBottom:20, color:"#dc2626", fontSize:12 }}>
+            ⚠ {error}
+          </div>
+        )}
+
+        {/* Status pills */}
+        {wx && (
+          <div style={{ display:"flex", flexWrap:"wrap", alignItems:"center", gap:8, marginBottom:24, animation:"fadeUp 0.5s ease" }}>
+            <Pill icon="☁" text={wxLabel(wx.weathercode)} />
+            <Pill icon="☀" text={`UV ${wx.uv_index?.toFixed(1)} — ${uv.text}`} color={uv.color} />
+            <Pill icon="🌡" text={`${wx.apparent?.toFixed(1)}°C feels like`} color="#f97316" />
+            {lastUpdated && (
+              <div style={{ marginLeft:"auto", fontSize:11, color:"#cbd5e1", display:"flex", alignItems:"center", gap:5 }}>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                  <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                </svg>
+                Updated {fmt_time(lastUpdated)}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Spinner */}
+        {loading && !wx && (
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:14, padding:"80px 0" }}>
+            <div style={{ width:44, height:44, border:"3px solid #e2e8f0", borderTop:"3px solid #3b82f6", borderRadius:"50%", animation:"spin 0.9s linear infinite" }} />
+            <div style={{ fontSize:11, color:"#94a3b8", letterSpacing:2.5 }}>FETCHING ATMOSPHERIC DATA</div>
+          </div>
+        )}
+
+        {wx && (
+          <>
+            {/* 4 main gauges */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))", gap:14, marginBottom:14 }}>
+              {cards.map((c, i) => <StatCard key={c.label} {...c} delay={i * 70} />)}
+            </div>
+
+            {/* Secondary panels */}
+            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(270px,1fr))", gap:14 }}>
+              {/* Atmosphere */}
+              <div style={{ background:"#fff", borderRadius:20, padding:"20px 22px", boxShadow:"0 1px 2px rgba(0,0,0,0.04),0 4px 16px rgba(0,0,0,0.04)", border:"1px solid #f1f5f9", animation:"fadeUp 0.6s ease" }}>
+                <SectionTitle>Atmosphere</SectionTitle>
+                <RowStat label="Dew Point"     value={wx.dewpoint     != null ? `${wx.dewpoint.toFixed(1)} °C`    : null} />
+                <RowStat label="Cloud Cover"   value={wx.cloudcover   != null ? `${Math.round(wx.cloudcover)} %`  : null} />
+                <RowStat label="Precipitation" value={wx.precipitation!= null ? `${wx.precipitation.toFixed(1)} mm`: null} accent="#3b82f6" />
+                <RowStat label="Visibility"    value={fmt_vis(wx.visibility)} />
+                <RowStat label="Condition"     value={wxLabel(wx.weathercode)} />
+              </div>
+
+              {/* Wind & Solar */}
+              <div style={{ background:"#fff", borderRadius:20, padding:"20px 22px", boxShadow:"0 1px 2px rgba(0,0,0,0.04),0 4px 16px rgba(0,0,0,0.04)", border:"1px solid #f1f5f9", animation:"fadeUp 0.7s ease" }}>
+                <SectionTitle>Wind & Solar</SectionTitle>
+                <RowStat label="Wind Speed"  value={wx.windspeed != null ? `${wx.windspeed.toFixed(1)} km/h`              : null} accent="#10b981" />
+                <RowStat label="Direction"   value={wx.wind_dir  != null ? `${windLabel(wx.wind_dir)} (${Math.round(wx.wind_dir)}°)` : null} />
+                <RowStat label="UV Index"    value={wx.uv_index  != null ? wx.uv_index.toFixed(1)                          : null} accent={uv.color} />
+                <RowStat label="UV Risk"     value={uv.text}                                                                         accent={uv.color} />
+                <RowStat label="Feels Like"  value={wx.apparent  != null ? `${wx.apparent.toFixed(1)} °C`                  : null} accent="#f97316" />
+              </div>
+
+              {/* Location card */}
+              <div style={{
+                background:"linear-gradient(150deg,#0f172a 0%,#1e293b 100%)",
+                borderRadius:20, padding:"20px 22px",
+                boxShadow:"0 1px 2px rgba(0,0,0,0.1),0 8px 24px rgba(0,0,0,0.12)",
+                display:"flex", flexDirection:"column", justifyContent:"space-between", minHeight:190,
+                animation:"fadeUp 0.8s ease",
+              }}>
+                <div>
+                  <div style={{ fontSize:10, color:"rgba(255,255,255,0.35)", letterSpacing:2.5, textTransform:"uppercase", marginBottom:10 }}>Location</div>
+                  <div style={{ fontFamily:"'Fraunces', serif", fontSize:26, fontWeight:800, color:"#fff", letterSpacing:-1, lineHeight:1.1 }}>
+                    {loc.name}
+                  </div>
+                  <div style={{ fontSize:13, color:"rgba(255,255,255,0.4)", marginTop:5, fontStyle:"italic", fontFamily:"'Fraunces', serif" }}>
+                    {[loc.admin1, loc.country].filter(Boolean).join(", ")}
+                  </div>
+                </div>
+                <div style={{ borderTop:"1px solid rgba(255,255,255,0.08)", paddingTop:14, display:"flex", justifyContent:"space-between" }}>
+                  {[
+                    ["Latitude", `${loc.lat?.toFixed(4)}°`],
+                    ["Longitude", `${loc.lon?.toFixed(4)}°`],
+                    ["Source", "Open-Meteo"],
+                  ].map(([k, v]) => (
+                    <div key={k}>
+                      <div style={{ fontSize:9, color:"rgba(255,255,255,0.3)", letterSpacing:2, textTransform:"uppercase" }}>{k}</div>
+                      <div style={{ fontSize:13, fontWeight:700, color: k==="Source" ? "#22c55e" : "#fff", marginTop:3 }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </main>
+
+      <footer style={{
+        borderTop:"1px solid #f1f5f9", background:"#fff",
+        padding:"14px clamp(16px,4vw,40px)",
+        display:"flex", justifyContent:"center", alignItems:"center",
+        gap:5, fontSize:11, color:"#cbd5e1",
+      }}>
+        <span>AtmoWatch · Real-time data via</span>
+        <span style={{ color:"#3b82f6", fontWeight:600 }}>Open-Meteo API</span>
+        <span>· Auto-refreshes every 5 min</span>
+      </footer>
     </div>
   );
 }
 
-async function fetchWeather(lat, lon) {
-  const params = [
-    "temperature_2m", "relative_humidity_2m", "windspeed_10m",
-    "surface_pressure", "uv_index", "precipitation",
-    "weathercode", "apparent_temperature", "visibility",
-    "wind_direction_10m", "dewpoint_2m",
-  ].join(",");
-
-  const url = `${API_WX}?latitude=${lat}&longitude=${lon}&current_weather=true&hourly=${params}&timezone=auto&forecast_days=1`;
-  const r = await fetch(url);
-  const d = await r.json();
-
-  const idx = 0;
-  const h = d.hourly;
-  return {
-    temperature:   h.temperature_2m?.[idx],
-    humidity:      h.relative_humidity_2m?.[idx],
-    windspeed:     h.windspeed_10m?.[idx],
-    pressure:      h.surface_pressure?.[idx],
-    uv_index:      h.uv_index?.[idx],
-    precipitation: h.precipitation?.[idx],
-    apparent:      h.apparent_temperature?.[idx],
-    visibility:    h.visibility?.[idx],
-    wind_dir:      h.wind_direction_10m?.[idx],
-    dewpoint:      h.dewpoint_2m?.[idx],
-    weathercode:   d.current_weather?.weathercode,
-    windspeed_cw:  d.current_weather?.windspeed,
-    temp_cw:       d.current_weather?.temperature,
-  };
+function clamp(min, mid, max) { return `clamp(${min}px, ${mid}vw, ${max}px)`; }
+function SectionTitle({ children }) {
+  return <div style={{ fontSize:10, fontWeight:500, letterSpacing:2.5, textTransform:"uppercase", color:"#94a3b8", marginBottom:10 }}>{children}</div>;
 }
-
-function wxCodeToLabel(code) {
-  if (code === undefined || code === null) return "—";
-  if (code === 0) return "Clear Sky";
-  if (code <= 3) return "Partly Cloudy";
-  if (code <= 9) return "Foggy";
-  if (code <= 19) return "Drizzle";
-  if (code <= 29) return "Rain";
-  if (code <= 39) return "Snow";
-  if (code <= 49) return "Sleet";
-  if (code <= 59) return "Thunderstorm";
-  if (code <= 69) return "Heavy Rain";
-  if (code <= 79) return "Heavy Snow";
-  if (code <= 89) return "Hail";
-  return "Thunderstorm";
-}
-
-function windDir(deg) {
-  if (deg === undefined || deg === null) return "—";
-  const dirs = ["N","NE","E","SE","S","SW","W","NW"];
-  return dirs[Math.round(deg / 45) % 8];
-}
-
-export default function App() {
-  const now = useNow();
-  const [location, setLocation] = useState(null);
-  const [wx, setWx] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
-  const [geoLoading, setGeoLoading] = useState(true);
-  const refreshRef = useRef(null);
-
-  const loadWeather = useCallback(async (loc) => {
-    setLoading(true); setError(null);
-    try {
-      const data = await fetchWeather(loc.lat, loc.lon);
-      setWx(data);
-    } catch (e) {
-      setError("Failed to fetch atmospheric data. Please try again.");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  // Auto-detect location on mount
-  useEffect(() => {
-    setGeoLoading(true);
-    navigator.geolocation?.getCurrentPosition(
-      async (pos) => {
-        const { latitude: lat, longitude: lon } = pos.coords;
-        try {
-          const r = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`);
-          const d = await r.json();
-          const loc = {
-            name: d.address?.city || d.address?.town || d.address?.village || "Your Location",
-            country: d.address?.country_code?.toUpperCase() || "",
-            admin1: d.address?.state || "",
-            lat, lon,
-          };
-          setLocation(loc);
-          await loadWeather(loc);
-        } catch {
-          const loc = { name: "Mumbai", country: "IN", admin1: "Maharashtra", lat: 19.076, lon: 72.877 };
-          setLocation(loc);
-          await loadWeather(loc);
-        }
-        setGeoLoading(false);
-      },
-      async () => {
-        const loc = { name: "Mumbai", country: "IN", admin1: "Maharashtra", lat: 19.076, lon: 72.877 };
-        setLocation(loc);
-        await loadWeather(loc);
-        setGeoLoading(false);
-      },
-      { timeout: 6000 }
-    );
-  }, [loadWeather]);
-
-  // Auto-refresh every 5 min
-  useEffect(() => {
-    if (!location) return;
-    clearInterval(refreshRef.current);
-    refreshRef.current = setInterval(() => loadWeather(location), 5 * 60 * 1000);
-    return () => clearInterval(refreshRef.current);
-  }, [location, loadWeather]);
-
-  const handleSearch = useCallback(async (loc) => {
-    setLocation(loc);
-    await loadWeather(loc);
-  }, [loadWeather]);
-
-  const uvLevel = (uv) => {
-    if (uv === null || uv === undefined) return { label: "—", color: "#fff" };
-    if (uv < 3) return { label: "Low", color: "#a3e635" };
-    if (uv < 6) return { label: "Moderate", color: "#fbbf24" };
-    if (uv < 8) return { label: "High", color: "#fb923c" };
-    if (uv < 11) return { label: "Very High", color: "#f43f5e" };
-    return { label: "Extreme", color: "#c026d3" };
-  };
-
-  const uv = uvLevel(wx?.uv_index);
-
+function Pill({ icon, text, color }) {
   return (
     <div style={{
-      minHeight: "100vh",
-      background: "#060b10",
-      color: "#fff",
-      fontFamily: "'Syne', sans-serif",
-      position: "relative",
-      overflow: "hidden",
+      background:"#fff", border:"1px solid #f1f5f9", borderRadius:100,
+      padding:"5px 14px", fontSize:11, color: color || "#64748b", fontWeight:color ? 700 : 500,
+      boxShadow:"0 1px 3px rgba(0,0,0,0.04)", display:"flex", alignItems:"center", gap:6,
     }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Space+Mono:wght@400;700&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #a3e635; border-radius: 4px; }
-        @keyframes pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(2.2);opacity:0} }
-        @keyframes scanline { 0%{transform:translateY(-100%)} 100%{transform:translateY(100vh)} }
-        @keyframes fadeUp { from{opacity:0;transform:translateY(20px)} to{opacity:1;transform:translateY(0)} }
-        @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
-      `}</style>
-
-      {/* Grid background */}
-      <div style={{
-        position: "fixed", inset: 0, zIndex: 0,
-        backgroundImage: `
-          linear-gradient(rgba(163,230,53,0.03) 1px, transparent 1px),
-          linear-gradient(90deg, rgba(163,230,53,0.03) 1px, transparent 1px)
-        `,
-        backgroundSize: "60px 60px",
-        pointerEvents: "none",
-      }} />
-
-      {/* Scanline effect */}
-      <div style={{
-        position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none", overflow: "hidden",
-      }}>
-        <div style={{
-          position: "absolute", left: 0, right: 0, height: "30%",
-          background: "linear-gradient(transparent, rgba(163,230,53,0.02), transparent)",
-          animation: "scanline 8s linear infinite",
-        }} />
-      </div>
-
-      {/* Radial glow */}
-      <div style={{
-        position: "fixed", top: "-20%", left: "50%", transform: "translateX(-50%)",
-        width: "80vw", height: "60vh",
-        background: "radial-gradient(ellipse, rgba(163,230,53,0.05) 0%, transparent 70%)",
-        pointerEvents: "none", zIndex: 0,
-      }} />
-
-      <div style={{ position: "relative", zIndex: 1, maxWidth: 1100, margin: "0 auto", padding: "0 24px 60px" }}>
-
-        {/* Header */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "24px 0 20px", flexWrap: "wrap", gap: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-            <div style={{
-              width: 42, height: 42, borderRadius: 12,
-              background: "linear-gradient(135deg, #a3e635, #16a34a)",
-              display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 20, boxShadow: "0 0 20px rgba(163,230,53,0.4)",
-            }}>🌍</div>
-            <div>
-              <div style={{ fontFamily: "'Syne', sans-serif", fontWeight: 800, fontSize: 20, letterSpacing: -0.5 }}>
-                ATMO<span style={{ color: "#a3e635" }}>WATCH</span>
-              </div>
-              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: 3, textTransform: "uppercase" }}>
-                Atmospheric Monitor
-              </div>
-            </div>
-          </div>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-            <PulseDot color="#a3e635" />
-            <span style={{ color: "#a3e635", fontFamily: "'Space Mono', monospace", fontSize: 10, letterSpacing: 2 }}>
-              LIVE
-            </span>
-            <div style={{ width: 1, height: 20, background: "rgba(255,255,255,0.1)" }} />
-            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 11, color: "rgba(255,255,255,0.5)", textAlign: "right" }}>
-              <div style={{ animation: "blink 1s infinite" }}>{fmtTime(now)}</div>
-              <div style={{ fontSize: 9, opacity: 0.6 }}>UTC+{-(now.getTimezoneOffset()/60) >= 0 ? "+" : ""}{-(now.getTimezoneOffset()/60)}</div>
-            </div>
-          </div>
-        </div>
-
-        {/* Date & Location Banner */}
-        <div style={{
-          background: "rgba(163,230,53,0.04)",
-          border: "1px solid rgba(163,230,53,0.12)",
-          borderRadius: 16, padding: "16px 24px",
-          marginBottom: 24, animation: "fadeUp 0.6s ease",
-          display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12,
-        }}>
-          <div>
-            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 4 }}>Current Location</div>
-            {geoLoading ? (
-              <div style={{ color: "rgba(255,255,255,0.3)", fontFamily: "Space Mono", fontSize: 13 }}>Detecting location…</div>
-            ) : (
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 16 }}>📍</span>
-                <span style={{ fontWeight: 700, fontSize: 18, letterSpacing: -0.3 }}>
-                  {location?.name}
-                </span>
-                {location?.admin1 && <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 13 }}>{location.admin1}</span>}
-                {location?.country && (
-                  <span style={{
-                    background: "rgba(163,230,53,0.15)", color: "#a3e635",
-                    padding: "2px 8px", borderRadius: 6, fontSize: 10, fontWeight: 700, letterSpacing: 1,
-                  }}>{location.country}</span>
-                )}
-              </div>
-            )}
-          </div>
-          <div style={{ textAlign: "right" }}>
-            <div style={{ color: "rgba(255,255,255,0.4)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 4 }}>Local Date</div>
-            <div style={{ fontFamily: "'Space Mono', monospace", fontSize: 13, color: "#fff" }}>{fmtDate(now)}</div>
-            {location && (
-              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, marginTop: 2 }}>
-                {location.lat?.toFixed(4)}°N, {location.lon?.toFixed(4)}°E
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* Search */}
-        <div style={{ marginBottom: 32, animation: "fadeUp 0.7s ease" }}>
-          <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 10 }}>
-            Search Another Location
-          </div>
-          <SearchBar onSearch={handleSearch} searching={loading} />
-        </div>
-
-        {/* Error */}
-        {error && (
-          <div style={{
-            background: "rgba(244,63,94,0.1)", border: "1px solid rgba(244,63,94,0.3)",
-            borderRadius: 12, padding: "12px 18px", marginBottom: 20, color: "#f43f5e",
-            fontFamily: "Space Mono", fontSize: 12,
-          }}>⚠ {error}</div>
-        )}
-
-        {/* Current Conditions Banner */}
-        {wx && !loading && (
-          <div style={{
-            background: "rgba(255,255,255,0.02)",
-            border: "1px solid rgba(255,255,255,0.06)",
-            borderRadius: 16, padding: "14px 24px", marginBottom: 28,
-            display: "flex", alignItems: "center", gap: 24, flexWrap: "wrap",
-            animation: "fadeUp 0.5s ease",
-          }}>
-            <div>
-              <div style={{ color: "rgba(255,255,255,0.35)", fontSize: 9, letterSpacing: 2, textTransform: "uppercase" }}>Condition</div>
-              <div style={{ fontSize: 15, fontWeight: 700, marginTop: 2 }}>{wxCodeToLabel(wx.weathercode)}</div>
-            </div>
-            <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.08)" }} />
-            <div>
-              <div style={{ color: "rgba(255,255,255,0.35)", fontSize: 9, letterSpacing: 2, textTransform: "uppercase" }}>Feels Like</div>
-              <div style={{ fontFamily: "Space Mono", fontSize: 15, color: "#ff6b35", marginTop: 2 }}>{wx.apparent?.toFixed(1)}°C</div>
-            </div>
-            <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.08)" }} />
-            <div>
-              <div style={{ color: "rgba(255,255,255,0.35)", fontSize: 9, letterSpacing: 2, textTransform: "uppercase" }}>Wind</div>
-              <div style={{ fontFamily: "Space Mono", fontSize: 15, color: "#a3e635", marginTop: 2 }}>
-                {wx.windspeed_cw?.toFixed(0)} km/h {windDir(wx.wind_dir)}
-              </div>
-            </div>
-            <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.08)" }} />
-            <div>
-              <div style={{ color: "rgba(255,255,255,0.35)", fontSize: 9, letterSpacing: 2, textTransform: "uppercase" }}>UV Index</div>
-              <div style={{ fontFamily: "Space Mono", fontSize: 15, color: uv.color, marginTop: 2 }}>
-                {wx.uv_index?.toFixed(1)} <span style={{ fontSize: 10 }}>({uv.label})</span>
-              </div>
-            </div>
-            <div style={{ width: 1, height: 32, background: "rgba(255,255,255,0.08)" }} />
-            <div>
-              <div style={{ color: "rgba(255,255,255,0.35)", fontSize: 9, letterSpacing: 2, textTransform: "uppercase" }}>Visibility</div>
-              <div style={{ fontFamily: "Space Mono", fontSize: 15, color: "#60a5fa", marginTop: 2 }}>
-                {wx.visibility ? `${(wx.visibility / 1000).toFixed(1)} km` : "—"}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Main Gauges */}
-        <div style={{ marginBottom: 12 }}>
-          <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 16 }}>
-            Primary Parameters
-          </div>
-          <div style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))",
-            gap: 16,
-            animation: "fadeUp 0.8s ease",
-          }}>
-            {DISPLAY_PARAMS.map(p => (
-              <ParamCard key={p} paramKey={p} value={wx?.[p === "windspeed" ? "windspeed_cw" : p === "temperature" ? "temp_cw" : p] ?? wx?.[p]} loading={loading} />
-            ))}
-          </div>
-        </div>
-
-        {/* Extras row */}
-        {wx && !loading && (
-          <div style={{
-            marginTop: 24, display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))",
-            gap: 16, animation: "fadeUp 0.9s ease",
-          }}>
-            <div style={{
-              background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)",
-              borderRadius: 18, padding: "20px 22px",
-            }}>
-              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>
-                Additional Parameters
-              </div>
-              <StatRow label="Dew Point" value={wx.dewpoint?.toFixed(1)} unit="°C" color="#38bdf8" />
-              <StatRow label="Precipitation" value={wx.precipitation?.toFixed(1)} unit="mm" color="#60a5fa" />
-              <StatRow label="UV Index" value={wx.uv_index?.toFixed(1)} unit="" color={uv.color} />
-              <StatRow label="Wind Direction" value={windDir(wx.wind_dir)} unit="" color="#a3e635" />
-            </div>
-
-            <div style={{
-              background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)",
-              borderRadius: 18, padding: "20px 22px",
-            }}>
-              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>
-                Atmospheric Details
-              </div>
-              <StatRow label="Surface Pressure" value={wx.pressure?.toFixed(0)} unit="hPa" color="#c084fc" />
-              <StatRow label="Visibility" value={wx.visibility ? (wx.visibility/1000).toFixed(1) : null} unit="km" color="#60a5fa" />
-              <StatRow label="Humidity" value={wx.humidity?.toFixed(0)} unit="%" color="#38bdf8" />
-              <StatRow label="Feels Like" value={wx.apparent?.toFixed(1)} unit="°C" color="#ff6b35" />
-            </div>
-
-            <div style={{
-              background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.07)",
-              borderRadius: 18, padding: "20px 22px",
-            }}>
-              <div style={{ color: "rgba(255,255,255,0.3)", fontSize: 10, letterSpacing: 2, textTransform: "uppercase", marginBottom: 14 }}>
-                Data Source
-              </div>
-              <StatRow label="Provider" value="Open-Meteo" unit="" color="#a3e635" />
-              <StatRow label="Resolution" value="1 km" unit="" color="#fff" />
-              <StatRow label="Refresh" value="Every 5 min" unit="" color="#fff" />
-              <StatRow label="Lat / Lon" value={`${location?.lat?.toFixed(2)}, ${location?.lon?.toFixed(2)}`} unit="" color="rgba(255,255,255,0.5)" />
-            </div>
-          </div>
-        )}
-
-        {/* Loading skeleton */}
-        {(loading || geoLoading) && !wx && (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "80px 0", gap: 20 }}>
-            <div style={{
-              width: 60, height: 60, border: "3px solid rgba(163,230,53,0.1)",
-              borderTop: "3px solid #a3e635", borderRadius: "50%",
-              animation: "spin 1s linear infinite",
-            }} />
-            <div style={{ color: "rgba(255,255,255,0.4)", fontFamily: "Space Mono", fontSize: 12, letterSpacing: 2 }}>
-              FETCHING ATMOSPHERIC DATA…
-            </div>
-          </div>
-        )}
-
-        {/* Footer */}
-        <div style={{
-          marginTop: 48, paddingTop: 20, borderTop: "1px solid rgba(255,255,255,0.05)",
-          display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8,
-        }}>
-          <span style={{ color: "rgba(255,255,255,0.18)", fontSize: 10, letterSpacing: 1.5 }}>
-            ATMOWATCH © 2026 · REAL-TIME ATMOSPHERIC MONITOR
-          </span>
-          <span style={{ color: "rgba(255,255,255,0.18)", fontSize: 10 }}>
-            Powered by Open-Meteo · No API key required
-          </span>
-        </div>
-      </div>
+      <span style={{ fontSize:13 }}>{icon}</span>
+      <span>{text}</span>
     </div>
   );
 }
